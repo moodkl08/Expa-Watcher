@@ -1,0 +1,57 @@
+name: EXPA applicant watcher
+
+on:
+  # Fires every 3 hours. Each run polls for up to ~5h45m before exiting
+  # cleanly, so consecutive runs overlap by a couple of hours — this keeps
+  # coverage continuous even if a scheduled trigger is delayed, which
+  # GitHub's scheduler sometimes does under load.
+  schedule:
+    - cron: "0 */3 * * *"
+  # Lets you (or me, while setting this up) start a run on demand from the
+  # Actions tab, e.g. to send a one-off test notification quickly.
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Run briefly (60s) just to verify everything wires up, instead of the full ~6h loop"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: expa-watcher
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # a bit under GitHub's 6h hard cap per job
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure git identity for state commits
+        run: |
+          git config user.name "expa-watcher-bot"
+          git config user.email "expa-watcher-bot@users.noreply.github.com"
+
+      - name: Run poller
+        env:
+          EXPA_URL: ${{ secrets.EXPA_URL }}
+          EXPA_METHOD: ${{ secrets.EXPA_METHOD }}
+          EXPA_HEADERS_JSON: ${{ secrets.EXPA_HEADERS_JSON }}
+          EXPA_BODY_JSON: ${{ secrets.EXPA_BODY_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POLL_INTERVAL_SECONDS: "5"
+          MAX_RUNTIME_SECONDS: ${{ github.event.inputs.test_mode == 'true' && '60' || '20700' }}
+        run: python poller.py
