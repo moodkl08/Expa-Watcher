@@ -48,6 +48,7 @@ jobs:
           EXPA_CLIENT_ID: ${{ secrets.EXPA_CLIENT_ID }}
           EXPA_CLIENT_SECRET: ${{ secrets.EXPA_CLIENT_SECRET }}
           EXPA_REFRESH_TOKEN: ${{ secrets.EXPA_REFRESH_TOKEN }}
+          GH_SECRETS_PAT: ${{ secrets.GH_SECRETS_PAT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           POLL_INTERVAL_SECONDS: "5"
