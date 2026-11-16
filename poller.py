@@ -44,6 +44,13 @@ EXPA_CLIENT_ID = os.environ["EXPA_CLIENT_ID"]
 EXPA_CLIENT_SECRET = os.environ["EXPA_CLIENT_SECRET"]
 EXPA_REFRESH_TOKEN = os.environ["EXPA_REFRESH_TOKEN"]
 
+# Optional: if set, lets the script update its own EXPA_REFRESH_TOKEN secret
+# on GitHub when AIESEC rotates it, so a rotation never requires you to do
+# anything by hand. GITHUB_REPOSITORY/GITHUB_API_URL are auto-set by Actions.
+GH_SECRETS_PAT = os.environ.get("GH_SECRETS_PAT", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -57,6 +64,58 @@ REQUEST_TIMEOUT_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
+# GitHub Actions secret auto-update (optional)
+# ---------------------------------------------------------------------------
+
+def update_github_secret(secret_name, secret_value):
+    """
+    Overwrites a GitHub Actions repository secret via the REST API, so a
+    rotated refresh token can be persisted without any manual step. Requires
+    GH_SECRETS_PAT (a token scoped to just this repo's secrets) to be set;
+    returns (True, None) on success or (False, reason) otherwise so callers
+    can fall back to alerting the user instead.
+    """
+    if not GH_SECRETS_PAT:
+        return False, "GH_SECRETS_PAT not configured"
+    if not GITHUB_REPOSITORY:
+        return False, "GITHUB_REPOSITORY not set (not running in Actions?)"
+
+    try:
+        from nacl import encoding, public
+    except ImportError:
+        return False, "PyNaCl not installed"
+
+    headers = {
+        "Authorization": f"Bearer {GH_SECRETS_PAT}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        pk_resp = requests.get(
+            f"{GITHUB_API_URL}/repos/{GITHUB_REPOSITORY}/actions/secrets/public-key",
+            headers=headers, timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        pk_resp.raise_for_status()
+        pk_data = pk_resp.json()
+
+        public_key = public.PublicKey(pk_data["key"].encode("utf-8"), encoding.Base64Encoder())
+        encrypted = public.SealedBox(public_key).encrypt(secret_value.encode("utf-8"))
+        encrypted_value = encoding.Base64Encoder().encode(encrypted).decode("utf-8")
+
+        put_resp = requests.put(
+            f"{GITHUB_API_URL}/repos/{GITHUB_REPOSITORY}/actions/secrets/{secret_name}",
+            headers=headers,
+            json={"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        put_resp.raise_for_status()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
 # OAuth access-token management
 # ---------------------------------------------------------------------------
 
@@ -64,12 +123,12 @@ class TokenManager:
     """
     Keeps a valid access token around, renewing it via the refresh_token
     grant before it expires (or immediately on a 401). AIESEC's refresh
-    tokens *might* rotate on use (i.e. the response hands back a new
-    refresh_token that must replace the old one); we handle that in memory
-    for the rest of this process, and — since there's no safe way to rewrite
-    a GitHub Actions secret from inside a run without granting it extra
-    permissions — we alert over Telegram if a rotation happens, so you can
-    update the EXPA_REFRESH_TOKEN secret by hand just that once.
+    tokens can rotate on use (the response hands back a new refresh_token
+    that must replace the old one); when that happens we update the
+    EXPA_REFRESH_TOKEN GitHub secret automatically via update_github_secret()
+    above, so this never requires a manual step. If that update fails (e.g.
+    GH_SECRETS_PAT isn't configured), we fall back to a Telegram alert
+    containing the new value so you can paste it in by hand just that once.
     """
 
     # Renew this long before the real expiry (observed to be ~7200s) so a
@@ -107,18 +166,30 @@ class TokenManager:
         new_refresh = data.get("refresh_token")
         if new_refresh and new_refresh != self.refresh_token:
             print(f"[warn] EXPA issued a NEW refresh token on renewal "
-                  f"(old {self._mask(self.refresh_token)} -> new {self._mask(new_refresh)}). "
-                  "Updating in-memory copy for this run.", file=sys.stderr)
+                  f"(old {self._mask(self.refresh_token)} -> new {self._mask(new_refresh)}).",
+                  file=sys.stderr)
             self.refresh_token = new_refresh
+
             if not self._rotation_alert_sent:
-                send_telegram(
-                    "⚠️ EXPA rotated your refresh token on renewal.\n"
-                    f"New refresh_token: {new_refresh}\n\n"
-                    "Please update the EXPA_REFRESH_TOKEN secret in the repo to this value "
-                    "so future restarts keep working (this running job will keep working "
-                    "fine on its own until it next restarts)."
-                )
                 self._rotation_alert_sent = True
+                updated, err = update_github_secret("EXPA_REFRESH_TOKEN", new_refresh)
+                if updated:
+                    print("[info] EXPA_REFRESH_TOKEN secret updated automatically on GitHub.")
+                    send_telegram(
+                        "🔄 EXPA rotated your refresh token — I updated the EXPA_REFRESH_TOKEN "
+                        "secret on GitHub automatically. No action needed."
+                    )
+                else:
+                    print(f"[warn] couldn't auto-update GitHub secret ({err}); alerting instead.",
+                          file=sys.stderr)
+                    send_telegram(
+                        "⚠️ EXPA rotated your refresh token on renewal, and I couldn't update "
+                        f"the GitHub secret automatically ({err}).\n"
+                        f"New refresh_token: {new_refresh}\n\n"
+                        "Please update the EXPA_REFRESH_TOKEN secret in the repo to this value "
+                        "so future restarts keep working (this running job will keep working "
+                        "fine on its own until it next restarts)."
+                    )
 
         print(f"[info] obtained access token (expires in {int(expires_in)}s).")
 
