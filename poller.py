@@ -186,21 +186,36 @@ def extract_applicants(response_json):
 
         person = item.get("person") or {}
         opportunity = item.get("opportunity") or {}
-        company = ((opportunity.get("branch") or {}).get("company") or {}).get("name", "")
+        organization = ((opportunity.get("branch") or {}).get("company") or {}).get("name", "")
 
         name = person.get("full_name") or "Unknown applicant"
         title = opportunity.get("title") or ""
         status = item.get("status") or ""
         applied_at = item.get("created_at") or ""
 
+        home_lc = (person.get("home_lc") or {}).get("name", "")
+        home_mc = (person.get("home_mc") or {}).get("name", "")
+        contact = person.get("contact_detail") or {}
+        country_code = contact.get("country_code") or ""
+        phone = contact.get("phone") or ""
+        full_phone = f"{country_code} {phone}".strip() if phone else ""
+
         parts = [name]
         if title:
             parts.append(title)
-        if company:
-            parts.append(f"@ {company}")
+        if organization:
+            parts.append(f"@ {organization}")
         display = " — ".join(parts)
+        if organization:
+            display += f"\nOrganization: {organization}"
         if status:
             display += f"\nStatus: {status}"
+        if home_lc:
+            display += f"\nHome LC: {home_lc}"
+        if home_mc:
+            display += f"\nHome MC: {home_mc}"
+        if full_phone:
+            display += f"\nPhone: {full_phone}"
         if applied_at:
             display += f"\nApplied: {applied_at}"
 
