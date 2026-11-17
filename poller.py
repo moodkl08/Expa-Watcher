@@ -119,6 +119,17 @@ def update_github_secret(secret_name, secret_value):
 # OAuth access-token management
 # ---------------------------------------------------------------------------
 
+class TokenRefreshError(Exception):
+    """
+    Raised specifically when the refresh_token grant itself fails (as
+    opposed to a normal applicant-fetch failure). This is distinguished on
+    purpose: retrying a dead refresh token every 5 seconds for hours is
+    pointless and wastes the whole job's runtime, so run_loop() treats this
+    differently — it gives up after a handful of tries instead of spinning
+    until the job's natural time limit.
+    """
+    pass
+
 class TokenManager:
     """
     Keeps a valid access token around, renewing it via the refresh_token
@@ -145,19 +156,22 @@ class TokenManager:
         return f"{token[:4]}…{token[-4:]}" if token and len(token) > 8 else "∅"
 
     def refresh(self):
-        resp = requests.post(
-            EXPA_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": self.refresh_token,
-                "client_id": EXPA_CLIENT_ID,
-                "client_secret": EXPA_CLIENT_SECRET,
-            },
-            headers={"accept": "application/json"},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = requests.post(
+                EXPA_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.refresh_token,
+                    "client_id": EXPA_CLIENT_ID,
+                    "client_secret": EXPA_CLIENT_SECRET,
+                },
+                headers={"accept": "application/json"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            raise TokenRefreshError(f"refresh_token grant failed: {e}") from e
 
         self.access_token = data["access_token"]
         expires_in = float(data.get("expires_in", 3600))
@@ -385,6 +399,13 @@ def fetch_applicants():
     return extract_applicants(resp.json())
 
 
+# If the refresh_token grant itself fails this many times in a row, stop
+# trying for the rest of this job instead of hammering a dead endpoint
+# every 5 seconds for hours — a short burst of retries covers a transient
+# blip, and beyond that it's not going to start working on its own.
+TOKEN_FAILURE_GIVEUP_THRESHOLD = 5
+
+
 def run_loop():
     start_time = time.monotonic()
     seen_ids = load_seen_ids()
@@ -395,12 +416,14 @@ def run_loop():
               "without notifying for pre-existing applicants.")
 
     consecutive_errors = 0
+    consecutive_token_failures = 0
 
     while time.monotonic() - start_time < MAX_RUNTIME_SECONDS:
         loop_start = time.monotonic()
         try:
             current = fetch_applicants()
             consecutive_errors = 0
+            consecutive_token_failures = 0
 
             if first_run_ever:
                 seen_ids = set(current.keys())
@@ -417,19 +440,39 @@ def run_loop():
                     seen_ids |= new_ids
                     persist_seen_ids(seen_ids, f"chore: mark {len(new_ids)} applicant(s) as seen")
 
+        except TokenRefreshError as e:
+            consecutive_token_failures += 1
+            print(f"[error] token refresh failed ({consecutive_token_failures} in a row): {e}",
+                  file=sys.stderr)
+            if consecutive_token_failures >= TOKEN_FAILURE_GIVEUP_THRESHOLD:
+                send_telegram(
+                    "🔴 EXPA watcher can't renew its access token after several attempts in a "
+                    "row — the refresh token has likely been revoked or invalidated (e.g. by a "
+                    "fresh login elsewhere, or a security/admin action on the AIESEC side).\n\n"
+                    "This needs a fresh browser capture to fix: incognito window → DevTools "
+                    "Network tab → log into EXPA → find the auth.aiesec.org/oauth/token request "
+                    "→ copy its response → send it over so the EXPA_REFRESH_TOKEN secret can be "
+                    "updated.\n\n"
+                    "Stopping this run now instead of retrying uselessly for hours — the next "
+                    "scheduled run will try again on its own, but won't succeed until the "
+                    "secret is fixed."
+                )
+                print("[error] giving up after repeated token failures; exiting this job early.",
+                      file=sys.stderr)
+                return
+
         except requests.RequestException as e:
             consecutive_errors += 1
             print(f"[warn] request failed ({consecutive_errors} in a row): {e}", file=sys.stderr)
             if consecutive_errors == 1 or consecutive_errors % 20 == 0:
                 # Don't spam Telegram on every single failure, but do alert
-                # on the first one and then periodically if it stays broken
-                # (most likely cause: the captured auth token expired).
+                # on the first one and then periodically if it stays broken.
                 send_telegram(
                     "⚠️ EXPA watcher is failing to fetch applicants "
                     f"(error #{consecutive_errors}): {e}\n"
-                    "Access tokens now renew automatically, so this is likely something else "
-                    "(e.g. the refresh token itself was revoked, or EXPA changed something) — "
-                    "worth checking the Actions logs."
+                    "This isn't a token problem (that's handled separately) — likely a transient "
+                    "network issue or EXPA being slow/down. Worth a glance at the Actions logs "
+                    "if it keeps happening."
                 )
         except Exception:
             print("[error] unexpected exception:", file=sys.stderr)
