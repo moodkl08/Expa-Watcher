@@ -54,6 +54,16 @@ GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# Optional second recipient (e.g. a teammate with their own bot/chat), so
+# every notification goes to both people at once. Only used if both of
+# these are set; harmless to leave unset.
+TELEGRAM_BOT_TOKEN_2 = os.environ.get("TELEGRAM_BOT_TOKEN_2", "")
+TELEGRAM_CHAT_ID_2 = os.environ.get("TELEGRAM_CHAT_ID_2", "")
+
+TELEGRAM_RECIPIENTS = [(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)]
+if TELEGRAM_BOT_TOKEN_2 and TELEGRAM_CHAT_ID_2:
+    TELEGRAM_RECIPIENTS.append((TELEGRAM_BOT_TOKEN_2, TELEGRAM_CHAT_ID_2))
+
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # Keep this comfortably under GitHub's 6-hour hard job limit so the job
 # exits cleanly (and commits state) before it gets killed mid-request.
@@ -365,17 +375,20 @@ def persist_seen_ids(seen_ids, commit_message):
 
 
 def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(
-            url,
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        if resp.status_code != 200:
-            print(f"[warn] telegram send failed: {resp.status_code} {resp.text}", file=sys.stderr)
-    except requests.RequestException as e:
-        print(f"[warn] telegram send error: {e}", file=sys.stderr)
+    """Sends to every configured recipient (you, plus an optional teammate)."""
+    for bot_token, chat_id in TELEGRAM_RECIPIENTS:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        try:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            if resp.status_code != 200:
+                print(f"[warn] telegram send failed for chat {chat_id}: {resp.status_code} {resp.text}",
+                      file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"[warn] telegram send error for chat {chat_id}: {e}", file=sys.stderr)
 
 
 def fetch_applicants():
